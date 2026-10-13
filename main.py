@@ -1,1192 +1,574 @@
-import os
-import re
-import io
-import time
-import asyncio
-import sqlite3
-import logging
+# ============================================================
+# TELEGRAM SECRETARY / CHAT AUTOMATION
+# File: main.py
+# Python 3.10+
+#
+# Works with the supplied database.py
+# ============================================================
 
-from datetime import datetime
+import os
+import asyncio
+import logging
+import time
+from typing import Optional
 
 from dotenv import load_dotenv
-from cryptography.fernet import Fernet
-import qrcode
-
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
+from telethon import TelegramClient, events
+from telethon.errors import (
+    FloodWaitError,
+    RPCError,
 )
 
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    ContextTypes,
+from database import (
+    init_database,
+    ensure_user,
+    get_settings,
+    get_setting,
+    set_setting,
+    get_selected_chat,
+    set_selected_chat,
+    get_selected_channel,
+    set_selected_channel,
+    add_blocked_word,
+    remove_blocked_word,
+    get_blocked_words,
+    add_warning,
+    get_warning_count,
+    clear_warnings,
+    log_action,
 )
-
-from telethon import TelegramClient, events, functions, types
-from telethon.sessions import StringSession
-from telethon.errors import FloodWaitError
-from telethon.tl.functions.channels import EditAdminRequest
-from telethon.tl.types import ChatAdminRights
 
 
 # ============================================================
-# CONFIG
+# ENVIRONMENT
 # ============================================================
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-API_ID = os.getenv("API_ID")
+API_ID_RAW = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
-SESSION_KEY = os.getenv("SESSION_KEY")
-PORT = int(os.getenv("PORT", "10000"))
+SESSION_NAME = os.getenv(
+    "SESSION_NAME",
+    "telegram_secretary"
+)
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is missing.")
-
-if not API_ID:
-    raise RuntimeError("API_ID is missing.")
+if not API_ID_RAW:
+    raise RuntimeError(
+        "API_ID is missing from .env"
+    )
 
 if not API_HASH:
-    raise RuntimeError("API_HASH is missing.")
+    raise RuntimeError(
+        "API_HASH is missing from .env"
+    )
 
-if not SESSION_KEY:
-    raise RuntimeError("SESSION_KEY is missing.")
+try:
+    API_ID = int(API_ID_RAW)
+except ValueError:
+    raise RuntimeError(
+        "API_ID must be a number."
+    )
 
-API_ID = int(API_ID)
 
-CIPHER = Fernet(SESSION_KEY.encode())
-
-DB_FILE = "secretary.db"
-
+# ============================================================
+# LOGGING
+# ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format=(
+        "%(asctime)s | "
+        "%(levelname)s | "
+        "%(name)s | "
+        "%(message)s"
+    ),
 )
 
-log = logging.getLogger("telegram-secretary")
-
-
-# ============================================================
-# RUNTIME
-# ============================================================
-
-CLIENTS = {}
-HANDLERS_INSTALLED = set()
-TASKS = {}
-LOGIN_FLOWS = {}
-STOPPED = set()
-
-LAST_REACTION = {}
-LAST_LINK_ACTION = {}
-
-
-# ============================================================
-# COMMAND SYSTEM
-# ============================================================
-
-COMMANDS = [
-
-    # ========================================================
-    # ADMIN MANAGEMENT
-    # ========================================================
-
-    "admins",
-    "adminlist",
-    "admininfo",
-    "admin",
-    "unadmin",
-    "promote",
-    "demote",
-    "setadmin",
-    "removeadmin",
-    "adminrights",
-    "adminslock",
-    "adminsunlock",
-    "adminlog",
-    "adminhistory",
-    "admincount",
-    "adminsearch",
-    "admincheck",
-    "adminpermissions",
-    "setpermissions",
-    "resetpermissions",
-    "addmanager",
-    "removemanager",
-    "managers",
-    "managerinfo",
-    "managerslock",
-    "managersunlock",
-    "owner",
-    "ownerinfo",
-    "coadmins",
-    "coadmin",
-    "uncoadmin",
-    "adminnotes",
-    "addadminnote",
-    "deladminnote",
-    "adminactivity",
-    "adminstats",
-    "adminonline",
-    "adminmute",
-    "adminunmute",
-    "adminprotect",
-    "adminunprotect",
-
-    # ========================================================
-    # MODERATOR PROTECTION
-    # ========================================================
-
-    "protect",
-    "unprotect",
-    "protectstatus",
-    "protectall",
-    "unprotectall",
-
-    "linkprotect",
-    "linkprotecton",
-    "linkprotectoff",
-
-    "inviteprotect",
-    "inviteprotecton",
-    "inviteprotectoff",
-
-    "spamprotect",
-    "spamprotecton",
-    "spamprotectoff",
-
-    "botprotect",
-    "botprotecton",
-    "botprotectoff",
-
-    "floodprotect",
-    "floodprotecton",
-    "floodprotectoff",
-
-    "mentionprotect",
-    "mentionprotecton",
-    "mentionprotectoff",
-
-    "forwardprotect",
-    "forwardprotecton",
-    "forwardprotectoff",
-
-    "mediaprotect",
-    "mediaprotecton",
-    "mediaprotectoff",
-
-    "newmemberprotect",
-    "newmemberprotecton",
-    "newmemberprotectoff",
-
-    "usernameprotect",
-    "usernameprotecton",
-    "usernameprotectoff",
-
-    "wordprotect",
-    "wordprotecton",
-    "wordprotectoff",
-
-    "raidmode",
-    "raidmodeon",
-    "raidmodeoff",
-
-    # ========================================================
-    # MODERATION
-    # ========================================================
-
-    "mute",
-    "unmute",
-    "ban",
-    "unban",
-    "kick",
-
-    "warn",
-    "unwarn",
-    "warnings",
-    "clearwarnings",
-
-    "restrict",
-    "unrestrict",
-
-    "lock",
-    "unlock",
-
-    "lockchat",
-    "unlockchat",
-
-    "lockmedia",
-    "unlockmedia",
-
-    "locklinks",
-    "unlocklinks",
-
-    "lockstickers",
-    "unlockstickers",
-
-    "lockgifs",
-    "unlockgifs",
-
-    "lockphotos",
-    "unlockphotos",
-
-    "lockvideos",
-    "unlockvideos",
-
-    "lockfiles",
-    "unlockfiles",
-
-    "lockvoice",
-    "unlockvoice",
-
-    "lockpolls",
-    "unlockpolls",
-
-    "slowmode",
-    "slowmodeoff",
-    "slowmode10",
-    "slowmode30",
-    "slowmode60",
-
-    # ========================================================
-    # MESSAGE MANAGEMENT
-    # ========================================================
-
-    "del",
-    "delete",
-
-    "purge",
-    "purge10",
-    "purge50",
-    "purge100",
-
-    "clear",
-    "clearlinks",
-    "clearspam",
-    "clearbots",
-    "clearmentions",
-    "clearmedia",
-    "clearfiles",
-    "clearphotos",
-    "clearvideos",
-    "clearstickers",
-    "cleargifs",
-    "clearforwards",
-
-    "deluser",
-    "userhistory",
-
-    "msginfo",
-    "messageinfo",
-
-    "pinned",
-    "pin",
-    "unpin",
-    "pinall",
-    "unpinall",
-
-    "clean",
-
-    "autoclean",
-    "autocleanon",
-    "autocleanoff",
-
-    # ========================================================
-    # MEMBER MANAGEMENT
-    # ========================================================
-
-    "members",
-    "membercount",
-    "memberinfo",
-    "membercheck",
-    "memberhistory",
-
-    "newmembers",
-    "recentmembers",
-
-    "inactive",
-    "active",
-
-    "verified",
-    "unverified",
-
-    "trusted",
-    "trust",
-    "untrust",
-
-    "vips",
-    "addvip",
-    "delvip",
-    "vip",
-
-    "ignore",
-    "unignore",
-    "ignored",
-
-    "whitelist",
-    "unwhitelist",
-
-    "blacklist",
-    "blacklistuser",
-
-    # ========================================================
-    # SECURITY
-    # ========================================================
-
-    "security",
-    "securitystatus",
-    "securityon",
-    "securityoff",
-
-    "audit",
-    "auditlog",
-
-    "modlog",
-    "modlogon",
-    "modlogoff",
-
-    "alerts",
-    "alertson",
-    "alertsoff",
-
-    "antiraid",
-    "antiraidon",
-    "antiraidoff",
-
-    "emergency",
-    "stop",
-    "resume",
-
-    "settings",
-    "resetsettings",
-    "backupsettings",
-    "restoresettings",
-
-    "rules",
-    "setrules",
-    "delrules",
-]
+logger = logging.getLogger(
+    "TelegramSecretary"
+)
 
 
 # ============================================================
 # DATABASE
 # ============================================================
 
-def db():
-
-    return sqlite3.connect(
-        DB_FILE,
-        timeout=30
-    )
+init_database()
 
 
-def init_db():
+# ============================================================
+# TELEGRAM CLIENT
+# ============================================================
 
-    con = db()
-
-    cur = con.cursor()
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            session TEXT,
-            connected INTEGER DEFAULT 0,
-            selected_chat INTEGER,
-            created_at TEXT,
-            updated_at TEXT
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
-            user_id INTEGER PRIMARY KEY,
-
-            auto_reply INTEGER DEFAULT 0,
-
-            auto_reply_message TEXT DEFAULT
-            'I am not online right now. I will message you later.',
-
-            always_online INTEGER DEFAULT 0,
-
-            online_status INTEGER DEFAULT 1,
-
-            auto_react INTEGER DEFAULT 0,
-
-            auto_react_emoji TEXT DEFAULT '👍',
-
-            global_protection INTEGER DEFAULT 0,
-
-            channel_protection INTEGER DEFAULT 0,
-
-            anti_link INTEGER DEFAULT 0,
-
-            anti_invite INTEGER DEFAULT 0,
-
-            anti_spam INTEGER DEFAULT 0,
-
-            anti_bot INTEGER DEFAULT 0,
-
-            anti_flood INTEGER DEFAULT 0,
-
-            anti_mention INTEGER DEFAULT 0,
-
-            anti_forward INTEGER DEFAULT 0,
-
-            anti_media INTEGER DEFAULT 0,
-
-            anti_newmember INTEGER DEFAULT 0,
-
-            raid_mode INTEGER DEFAULT 0,
-
-            warning_limit INTEGER DEFAULT 5
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS warnings (
-            user_id INTEGER,
-            chat_id INTEGER,
-            target_id INTEGER,
-            count INTEGER DEFAULT 0,
-
-            PRIMARY KEY (
-                user_id,
-                chat_id,
-                target_id
-            )
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS chat_settings (
-            user_id INTEGER,
-            chat_id INTEGER,
-            key TEXT,
-            value TEXT,
-
-            PRIMARY KEY (
-                user_id,
-                chat_id,
-                key
-            )
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            chat_id INTEGER,
-            action TEXT,
-            target_id INTEGER,
-            details TEXT,
-            created_at TEXT
-        )
-    """)
-
-    con.commit()
-
-    con.close()
+client = TelegramClient(
+    SESSION_NAME,
+    API_ID,
+    API_HASH,
+)
 
 
-def ensure_user(user_id):
+# ============================================================
+# GLOBAL ACCOUNT STATE
+# ============================================================
 
-    con = db()
-
-    cur = con.cursor()
-
-    now = datetime.utcnow().isoformat()
-
-    cur.execute(
-        """
-        INSERT OR IGNORE INTO users (
-            user_id,
-            created_at,
-            updated_at
-        )
-        VALUES (?, ?, ?)
-        """,
-        (
-            user_id,
-            now,
-            now
-        )
-    )
-
-    cur.execute(
-        """
-        INSERT OR IGNORE INTO settings (
-            user_id
-        )
-        VALUES (?)
-        """,
-        (
-            user_id,
-        )
-    )
-
-    con.commit()
-
-    con.close()
+OWNER_ID: Optional[int] = None
+OWNER_NAME: str = "Unknown"
 
 
-def get_setting(
-    user_id,
-    key,
-    default=None
-):
+# ============================================================
+# AUTO-REPLY COOLDOWN
+#
+# Prevents the secretary from repeatedly replying to the same
+# person every time they send a message.
+# ============================================================
 
-    ensure_user(
-        user_id
-    )
+AUTO_REPLY_COOLDOWN = 60
 
-    allowed = {
-        "auto_reply",
-        "auto_reply_message",
-        "always_online",
-        "online_status",
-        "auto_react",
-        "auto_react_emoji",
-        "global_protection",
-        "channel_protection",
-        "anti_link",
-        "anti_invite",
-        "anti_spam",
-        "anti_bot",
-        "anti_flood",
-        "anti_mention",
-        "anti_forward",
-        "anti_media",
-        "anti_newmember",
-        "raid_mode",
-        "warning_limit"
+last_auto_reply = {}
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def is_enabled(value) -> bool:
+    """
+    Convert SQLite values into a reliable boolean.
+    """
+
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, int):
+        return value == 1
+
+    if value is None:
+        return False
+
+    return str(value).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+        "enabled",
     }
 
-    if key not in allowed:
-        return default
 
-    con = db()
+def get_auto_reply_message(
+    user_id: int
+) -> str:
 
-    cur = con.cursor()
-
-    cur.execute(
-        f"""
-        SELECT {key}
-        FROM settings
-        WHERE user_id = ?
-        """,
-        (
-            user_id,
-        )
-    )
-
-    row = cur.fetchone()
-
-    con.close()
-
-    if not row:
-        return default
-
-    return row[0]
-
-
-def set_setting(
-    user_id,
-    key,
-    value
-):
-
-    ensure_user(
-        user_id
-    )
-
-    allowed = {
-        "auto_reply",
-        "auto_reply_message",
-        "always_online",
-        "online_status",
-        "auto_react",
-        "auto_react_emoji",
-        "global_protection",
-        "channel_protection",
-        "anti_link",
-        "anti_invite",
-        "anti_spam",
-        "anti_bot",
-        "anti_flood",
-        "anti_mention",
-        "anti_forward",
-        "anti_media",
-        "anti_newmember",
-        "raid_mode",
-        "warning_limit"
-    }
-
-    if key not in allowed:
-        raise ValueError(
-            "Invalid setting"
-        )
-
-    con = db()
-
-    cur = con.cursor()
-
-    cur.execute(
-        f"""
-        UPDATE settings
-        SET {key} = ?
-        WHERE user_id = ?
-        """,
-        (
-            value,
-            user_id
-        )
-    )
-
-    con.commit()
-
-    con.close()
-
-
-def save_session(
-    user_id,
-    session_string
-):
-
-    encrypted = CIPHER.encrypt(
-        session_string.encode()
-    ).decode()
-
-    con = db()
-
-    cur = con.cursor()
-
-    cur.execute(
-        """
-        UPDATE users
-        SET
-            session = ?,
-            connected = 1,
-            updated_at = ?
-        WHERE user_id = ?
-        """,
-        (
-            encrypted,
-            datetime.utcnow().isoformat(),
-            user_id
-        )
-    )
-
-    con.commit()
-
-    con.close()
-
-
-def load_session(user_id):
-
-    con = db()
-
-    cur = con.cursor()
-
-    cur.execute(
-        """
-        SELECT session
-        FROM users
-        WHERE user_id = ?
-        """,
-        (
-            user_id,
-        )
-    )
-
-    row = cur.fetchone()
-
-    con.close()
-
-    if not row:
-        return None
-
-    if not row[0]:
-        return None
-
-    try:
-
-        return CIPHER.decrypt(
-            row[0].encode()
-        ).decode()
-
-    except Exception:
-
-        log.exception(
-            "Could not decrypt session"
-        )
-
-        return None
-
-
-def selected_chat(user_id):
-
-    con = db()
-
-    cur = con.cursor()
-
-    cur.execute(
-        """
-        SELECT selected_chat
-        FROM users
-        WHERE user_id = ?
-        """,
-        (
-            user_id,
-        )
-    )
-
-    row = cur.fetchone()
-
-    con.close()
-
-    if not row:
-        return None
-
-    return row[0]
-
-
-def set_selected_chat(
-    user_id,
-    chat_id
-):
-
-    con = db()
-
-    cur = con.cursor()
-
-    cur.execute(
-        """
-        UPDATE users
-        SET selected_chat = ?
-        WHERE user_id = ?
-        """,
-        (
-            chat_id,
-            user_id
-        )
-    )
-
-    con.commit()
-
-    con.close()
-
-
-# ============================================================
-# WARNING DATABASE
-# ============================================================
-
-def get_warning_count(
-    user_id,
-    chat_id,
-    target_id
-):
-
-    con = db()
-
-    cur = con.cursor()
-
-    cur.execute(
-        """
-        SELECT count
-        FROM warnings
-        WHERE
-            user_id = ?
-            AND chat_id = ?
-            AND target_id = ?
-        """,
-        (
-            user_id,
-            chat_id,
-            target_id
-        )
-    )
-
-    row = cur.fetchone()
-
-    con.close()
-
-    if not row:
-        return 0
-
-    return row[0]
-
-
-def add_warning(
-    user_id,
-    chat_id,
-    target_id
-):
-
-    count = (
-        get_warning_count(
-            user_id,
-            chat_id,
-            target_id
-        )
-        + 1
-    )
-
-    con = db()
-
-    cur = con.cursor()
-
-    cur.execute(
-        """
-        INSERT INTO warnings (
-            user_id,
-            chat_id,
-            target_id,
-            count
-        )
-        VALUES (?, ?, ?, ?)
-
-        ON CONFLICT(
-            user_id,
-            chat_id,
-            target_id
-        )
-
-        DO UPDATE SET
-            count = excluded.count
-        """,
-        (
-            user_id,
-            chat_id,
-            target_id,
-            count
-        )
-    )
-
-    con.commit()
-
-    con.close()
-
-    return count
-
-
-def clear_warnings(
-    user_id,
-    chat_id,
-    target_id
-):
-
-    con = db()
-
-    cur = con.cursor()
-
-    cur.execute(
-        """
-        DELETE FROM warnings
-        WHERE
-            user_id = ?
-            AND chat_id = ?
-            AND target_id = ?
-        """,
-        (
-            user_id,
-            chat_id,
-            target_id
-        )
-    )
-
-    con.commit()
-
-    con.close()
-
-
-# ============================================================
-# CLIENT
-# ============================================================
-
-async def get_client(user_id):
-
-    if user_id in STOPPED:
-        return None
-
-    if user_id in CLIENTS:
-
-        client = CLIENTS[user_id]
-
-        if not client.is_connected():
-
-            await client.connect()
-
-        return client
-
-    session = load_session(
-        user_id
-    )
-
-    if not session:
-        return None
-
-    client = TelegramClient(
-        StringSession(session),
-        API_ID,
-        API_HASH
-    )
-
-    await client.connect()
-
-    if not await client.is_user_authorized():
-
-        await client.disconnect()
-
-        return None
-
-    CLIENTS[user_id] = client
-
-    await install_handlers(
+    message = get_setting(
         user_id,
-        client
+        "auto_reply_message",
+        None,
     )
 
-    return client
+    if not message:
+        return (
+            "I'm not online, "
+            "I will msg you later."
+        )
+
+    return str(message)
+
+
+def owner_id() -> Optional[int]:
+    """
+    Return the logged-in Telegram account ID.
+    """
+
+    return OWNER_ID
+
+
+def owner_ready() -> bool:
+    return OWNER_ID is not None
+
+
+def command_user_allowed(event) -> bool:
+    """
+    Only the account owner can change secretary settings.
+
+    This prevents another Telegram user from sending commands
+    such as /set msg on to control your secretary.
+    """
+
+    if OWNER_ID is None:
+        return False
+
+    return event.sender_id == OWNER_ID
+
+
+async def owner_only(event) -> bool:
+    """
+    Send an error when a command is not sent by the owner.
+    """
+
+    if command_user_allowed(event):
+        return True
+
+    await event.respond(
+        "⛔ This command is only available "
+        "to the account owner."
+    )
+
+    return False
+
+
+def cooldown_allows(
+    chat_id: int
+) -> bool:
+
+    now = time.monotonic()
+
+    previous = last_auto_reply.get(
+        chat_id
+    )
+
+    if previous is not None:
+
+        if now - previous < AUTO_REPLY_COOLDOWN:
+            return False
+
+    last_auto_reply[chat_id] = now
+
+    return True
+
+
+def format_setting(
+    key: str,
+    value
+) -> str:
+
+    boolean_keys = {
+        "auto_reply",
+        "always_online",
+        "online_status",
+        "auto_react",
+        "global_protection",
+        "channel_protection",
+        "anti_link",
+        "anti_invite",
+        "anti_spam",
+        "anti_bot",
+        "anti_flood",
+        "anti_mention",
+        "anti_forward",
+        "anti_media",
+        "anti_newmember",
+        "anti_username",
+        "anti_word",
+        "raid_mode",
+        "modlog",
+        "alerts",
+        "autoclean",
+    }
+
+    if key in boolean_keys:
+
+        return (
+            "ON 🟢"
+            if is_enabled(value)
+            else "OFF 🔴"
+        )
+
+    return str(value)
 
 
 # ============================================================
-# MENU
+# /START
 # ============================================================
 
-WELCOME = """
-┊　　┊　　┊　　✦　　┊　　┊
-┊　　┊ ★  Welcome to Spy Bot
-┊　　✦　　　 🖤　　　 ✦
-★　　 ⋆｡°✩ ⋆｡°✩　　 ★
+@client.on(
+    events.NewMessage(
+        pattern=r"^/start$"
+    )
+)
+async def start_handler(event):
 
-🖤 Your personal Telegram assistant.
+    if not await owner_only(event):
+        return
 
-Control your connected Telegram account,
-groups, channels and automation below.
+    await event.respond(
+        "👑 TELEGRAM SECRETARY\n\n"
+        "Your secretary is online.\n\n"
 
-Choose an option 👇
-"""
+        "⚙️ BASIC\n"
+        "/status\n"
+        "/settings\n"
+        "/help\n\n"
 
+        "💬 AUTO REPLY\n"
+        "/set msg on\n"
+        "/set msg off\n"
+        "/setmsg <message>\n"
+        "/getmsg\n\n"
 
-def menu():
+        "👥 CHAT\n"
+        "/chat\n"
+        "/channel\n\n"
 
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "🔗 Connect ➜",
-                    callback_data="connect"
-                )
-            ],
+        "🛡️ PROTECTION\n"
+        "/protection on\n"
+        "/protection off\n\n"
 
-            [
-                InlineKeyboardButton(
-                    "👤 Account",
-                    callback_data="account"
-                ),
+        "🚫 WORD FILTER\n"
+        "/blockword word\n"
+        "/unblockword word\n"
+        "/blockedwords\n\n"
 
-                InlineKeyboardButton(
-                    "📊 Status",
-                    callback_data="status"
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    "👥 Groups",
-                    callback_data="groups"
-                ),
-
-                InlineKeyboardButton(
-                    "📢 Channels",
-                    callback_data="channels"
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    "🛡️ Protection",
-                    callback_data="protection"
-                ),
-
-                InlineKeyboardButton(
-                    "🔨 Moderator",
-                    callback_data="moderation"
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    "🤖 Auto Reply",
-                    callback_data="autoreply"
-                ),
-
-                InlineKeyboardButton(
-                    "❤️ Auto React",
-                    callback_data="autoreact"
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    "🟢 Online",
-                    callback_data="online"
-                ),
-
-                InlineKeyboardButton(
-                    "⚙️ Settings",
-                    callback_data="settings"
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    "🛑 Emergency Stop",
-                    callback_data="stop"
-                )
-            ]
-        ]
+        "⚠️ WARNINGS\n"
+        "/warn\n"
+        "/warnings\n"
+        "/clearwarn"
     )
 
 
 # ============================================================
-# START
+# /HELP
 # ============================================================
 
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+@client.on(
+    events.NewMessage(
+        pattern=r"^/help$"
+    )
+)
+async def help_handler(event):
 
-    user_id = update.effective_user.id
+    if not await owner_only(event):
+        return
 
-    ensure_user(
+    await event.respond(
+        "🤖 TELEGRAM SECRETARY\n"
+        "COMMAND CENTER\n\n"
+
+        "📊 STATUS\n"
+        "/status\n"
+        "/settings\n\n"
+
+        "💬 AUTO REPLY\n"
+        "/set msg on\n"
+        "/set msg off\n"
+        "/setmsg <message>\n"
+        "/getmsg\n\n"
+
+        "👥 CHAT SELECTION\n"
+        "/chat\n"
+        "/channel\n\n"
+
+        "🛡️ PROTECTION\n"
+        "/protection on\n"
+        "/protection off\n\n"
+
+        "🚫 BLOCKED WORDS\n"
+        "/blockword <word>\n"
+        "/unblockword <word>\n"
+        "/blockedwords\n\n"
+
+        "⚠️ WARNINGS\n"
+        "Reply to a message and use:\n"
+        "/warn\n"
+        "/warnings\n"
+        "/clearwarn"
+    )
+
+
+# ============================================================
+# /STATUS
+# ============================================================
+
+@client.on(
+    events.NewMessage(
+        pattern=r"^/status$"
+    )
+)
+async def status_handler(event):
+
+    if not await owner_only(event):
+        return
+
+    user_id = owner_id()
+
+    if user_id is None:
+        return
+
+    settings = get_settings(
         user_id
     )
 
-    await update.message.reply_text(
-        WELCOME,
-        reply_markup=menu()
-    )
-
-
-# ============================================================
-# STATUS
-# ============================================================
-
-async def status_cmd(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    user_id = update.effective_user.id
-
-    client = await get_client(
-        user_id
-    )
-
-    connected = bool(
-        client
-    )
-
-    text = (
-        "📊 BOT STATUS\n\n"
-
-        "Control Bot: 🟢 Online\n"
-
-        f"Account: "
-        f"{'🟢 Connected' if connected else '🔴 Not Connected'}\n"
-
-        f"Always Online: "
-        f"{'🟢 ON' if get_setting(user_id, 'always_online', 0) else '⚪ OFF'}\n"
-
-        f"Auto Reply: "
-        f"{'🟢 ON' if get_setting(user_id, 'auto_reply', 0) else '⚪ OFF'}\n"
-
-        f"Auto React: "
-        f"{'🟢 ON' if get_setting(user_id, 'auto_react', 0) else '⚪ OFF'}\n"
-
-        f"Channel Protection: "
-        f"{'🟢 ON' if get_setting(user_id, 'channel_protection', 0) else '⚪ OFF'}"
-    )
-
-    await update.message.reply_text(
-        text
-    )
-
-
-# ============================================================
-# AUTO REPLY
-# ============================================================
-
-async def set_cmd(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    user_id = update.effective_user.id
-
-    args = context.args
-
-    if not args:
-
-        await update.message.reply_text(
-            "Usage:\n\n"
-            "/set msg on\n"
-            "/set msg off\n"
-            "/set msg Your message"
-        )
-
-        return
-
-    if args[0].lower() != "msg":
-
-        return
-
-    if (
-        len(args) >= 2
-        and args[1].lower() == "on"
-    ):
-
-        set_setting(
-            user_id,
-            "auto_reply",
-            1
-        )
-
-        await update.message.reply_text(
-            "🟢 Automatic reply ON."
-        )
-
-        return
-
-    if (
-        len(args) >= 2
-        and args[1].lower() == "off"
-    ):
-
-        set_setting(
-            user_id,
+    auto_reply = is_enabled(
+        settings.get(
             "auto_reply",
             0
         )
+    )
 
-        await update.message.reply_text(
-            "🔴 Automatic reply OFF."
+    protection = is_enabled(
+        settings.get(
+            "global_protection",
+            0
         )
+    )
 
+    always_online = is_enabled(
+        settings.get(
+            "always_online",
+            0
+        )
+    )
+
+    auto_react = is_enabled(
+        settings.get(
+            "auto_react",
+            0
+        )
+    )
+
+    selected_chat = get_selected_chat(
+        user_id
+    )
+
+    selected_channel = get_selected_channel(
+        user_id
+    )
+
+    await event.respond(
+        "📊 SECRETARY STATUS\n\n"
+
+        f"👤 Account: {OWNER_NAME}\n"
+        f"🆔 ID: `{user_id}`\n\n"
+
+        f"💬 Auto reply: "
+        f"{'ON 🟢' if auto_reply else 'OFF 🔴'}\n"
+
+        f"🛡️ Protection: "
+        f"{'ON 🟢' if protection else 'OFF 🔴'}\n"
+
+        f"🟢 Always-online setting: "
+        f"{'ON' if always_online else 'OFF'}\n"
+
+        f"👍 Auto-react: "
+        f"{'ON' if auto_react else 'OFF'}\n\n"
+
+        f"👥 Selected chat: "
+        f"{selected_chat or 'None'}\n"
+
+        f"📢 Selected channel: "
+        f"{selected_channel or 'None'}"
+    )
+
+
+# ============================================================
+# /SETTINGS
+# ============================================================
+
+@client.on(
+    events.NewMessage(
+        pattern=r"^/settings$"
+    )
+)
+async def settings_handler(event):
+
+    if not await owner_only(event):
         return
 
-    message = " ".join(
-        args[1:]
-    ).strip()
+    user_id = owner_id()
+
+    if user_id is None:
+        return
+
+    settings = get_settings(
+        user_id
+    )
+
+    lines = [
+        "⚙️ YOUR SECRETARY SETTINGS",
+        "",
+    ]
+
+    for key, value in settings.items():
+
+        if key == "user_id":
+            continue
+
+        lines.append(
+            f"• {key}: "
+            f"{format_setting(key, value)}"
+        )
+
+    await event.respond(
+        "\n".join(lines)
+    )
+
+
+# ============================================================
+# /SET MSG ON
+# /SET MSG OFF
+# ============================================================
+
+@client.on(
+    events.NewMessage(
+        pattern=r"^/set\s+msg\s+(on|off)$"
+    )
+)
+async def set_msg_handler(event):
+
+    if not await owner_only(event):
+        return
+
+    user_id = owner_id()
+
+    command = (
+        event.pattern_match
+        .group(1)
+        .lower()
+    )
+
+    enabled = command == "on"
+
+    set_setting(
+        user_id,
+        "auto_reply",
+        1 if enabled else 0
+    )
+
+    await event.respond(
+        "💬 Automatic reply is now "
+        + (
+            "ON 🟢"
+            if enabled
+            else "OFF 🔴"
+        )
+    )
+
+
+# ============================================================
+# /SETMSG
+# ============================================================
+
+@client.on(
+    events.NewMessage(
+        pattern=r"^/setmsg\s+(.+)$"
+    )
+)
+async def setmsg_handler(event):
+
+    if not await owner_only(event):
+        return
+
+    user_id = owner_id()
+
+    message = (
+        event.pattern_match
+        .group(1)
+        .strip()
+    )
 
     if not message:
+
+        await event.respond(
+            "❌ Please provide a message."
+        )
 
         return
 
@@ -1196,1244 +578,805 @@ async def set_cmd(
         message
     )
 
-    set_setting(
-        user_id,
-        "auto_reply",
-        1
+    await event.respond(
+        "✅ Automatic reply saved.\n\n"
+        f"💬 {message}"
     )
 
-    await update.message.reply_text(
-        "✅ Auto reply saved and enabled.\n\n"
+
+# ============================================================
+# /GETMSG
+# ============================================================
+
+@client.on(
+    events.NewMessage(
+        pattern=r"^/getmsg$"
+    )
+)
+async def getmsg_handler(event):
+
+    if not await owner_only(event):
+        return
+
+    user_id = owner_id()
+
+    message = get_auto_reply_message(
+        user_id
+    )
+
+    await event.respond(
+        "💬 CURRENT AUTO-REPLY\n\n"
         f"{message}"
     )
 
 
 # ============================================================
-# AUTO REACT
+# /CHAT
 # ============================================================
 
-async def autoreact_cmd(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    user_id = update.effective_user.id
-
-    if not context.args:
-
-        await update.message.reply_text(
-            "Usage: /autoreact on|off"
-        )
-
-        return
-
-    enabled = (
-        context.args[0].lower()
-        == "on"
+@client.on(
+    events.NewMessage(
+        pattern=r"^/chat$"
     )
-
-    set_setting(
-        user_id,
-        "auto_react",
-        int(enabled)
-    )
-
-    await update.message.reply_text(
-        "❤️ Auto React "
-        + (
-            "ON"
-            if enabled
-            else "OFF"
-        )
-    )
-
-
-# ============================================================
-# ALWAYS ONLINE
-# ============================================================
-
-async def online_loop(user_id):
-
-    while True:
-
-        try:
-
-            if user_id in STOPPED:
-                return
-
-            if not get_setting(
-                user_id,
-                "always_online",
-                0
-            ):
-                return
-
-            client = await get_client(
-                user_id
-            )
-
-            if client:
-
-                await client(
-                    functions.account.UpdateStatusRequest(
-                        offline=False
-                    )
-                )
-
-        except FloodWaitError as error:
-
-            await asyncio.sleep(
-                min(
-                    error.seconds,
-                    300
-                )
-            )
-
-        except asyncio.CancelledError:
-
-            return
-
-        except Exception:
-
-            log.exception(
-                "Always-online update failed"
-            )
-
-        await asyncio.sleep(
-            60
-        )
-
-
-async def alwaysonline_cmd(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    user_id = update.effective_user.id
-
-    if not context.args:
-
-        await update.message.reply_text(
-            "Usage: /alwaysonline on|off"
-        )
-
-        return
-
-    enabled = (
-        context.args[0].lower()
-        == "on"
-    )
-
-    set_setting(
-        user_id,
-        "always_online",
-        int(enabled)
-    )
-
-    if enabled:
-
-        client = await get_client(
-            user_id
-        )
-
-        if not client:
-
-            await update.message.reply_text(
-                "❌ Connect your Telegram account first."
-            )
-
-            return
-
-        old_task = TASKS.get(
-            user_id
-        )
-
-        if (
-            not old_task
-            or old_task.done()
-        ):
-
-            TASKS[user_id] = asyncio.create_task(
-                online_loop(
-                    user_id
-                )
-            )
-
-        await update.message.reply_text(
-            "🟢 Always-online mode ON.\n\n"
-            "Telegram privacy settings can still affect "
-            "who can see your status."
-        )
-
-    else:
-
-        task = TASKS.pop(
-            user_id,
-            None
-        )
-
-        if task:
-
-            task.cancel()
-
-        await update.message.reply_text(
-            "⚪ Always-online mode OFF."
-        )
-
-
-# ============================================================
-# GROUPS
-# ============================================================
-
-async def groups_cmd(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    user_id = update.effective_user.id
-
-    client = await get_client(
-        user_id
-    )
-
-    if not client:
-
-        await update.message.reply_text(
-            "❌ Connect Telegram first."
-        )
-
-        return
-
-    buttons = []
-
-    async for dialog in client.iter_dialogs():
-
-        if not dialog.is_group:
-            continue
-
-        try:
-
-            me = await client.get_me()
-
-            permissions = (
-                await client.get_permissions(
-                    dialog.entity,
-                    me.id
-                )
-            )
-
-            role = (
-                "👑"
-                if permissions.is_admin
-                or permissions.is_creator
-                else "👤"
-            )
-
-        except Exception:
-
-            role = "👤"
-
-        buttons.append(
-            [
-                InlineKeyboardButton(
-                    f"{role} {dialog.name[:35]}",
-                    callback_data=f"group:{dialog.id}"
-                )
-            ]
-        )
-
-        if len(buttons) >= 50:
-            break
-
-    if not buttons:
-
-        await update.message.reply_text(
-            "No groups found."
-        )
-
-        return
-
-    await update.message.reply_text(
-        "👥 SELECT GROUP\n\n"
-        "👑 = Admin\n"
-        "👤 = Member",
-        reply_markup=InlineKeyboardMarkup(
-            buttons
-        )
-    )
-
-
-# ============================================================
-# PROTECTION PANEL
-# ============================================================
-
-def protection_panel(
-    user_id
-):
-
-    def state(key):
-
-        return (
-            "🟢 ON"
-            if get_setting(
-                user_id,
-                key,
-                0
-            )
-            else "⚪ OFF"
-        )
-
-    return (
-        "🛡️ MODERATOR PROTECTION\n\n"
-
-        f"🔗 Anti-Link: {state('anti_link')}\n"
-
-        f"📩 Anti-Invite: {state('anti_invite')}\n"
-
-        f"🚫 Anti-Spam: {state('anti_spam')}\n"
-
-        f"🤖 Anti-Bot: {state('anti_bot')}\n"
-
-        f"🌊 Anti-Flood: {state('anti_flood')}\n"
-
-        f"@ Anti-Mention: {state('anti_mention')}\n"
-
-        f"↪️ Anti-Forward: {state('anti_forward')}\n"
-
-        f"🖼 Anti-Media: {state('anti_media')}\n"
-
-        f"👤 New Member: {state('anti_newmember')}\n"
-
-        f"🚨 Raid Mode: {state('raid_mode')}\n\n"
-
-        f"⚠️ Warning Limit: "
-        f"{get_setting(user_id, 'warning_limit', 5)}"
-    )
-
-
-# ============================================================
-# WARNING / PROTECTION EVENT
-# ============================================================
-
-URL_PATTERN = re.compile(
-    r"(https?://|www\.|t\.me/|telegram\.me/)",
-    re.IGNORECASE
 )
+async def chat_handler(event):
 
+    if not await owner_only(event):
+        return
 
-async def protected_delete_and_warn(
-    user_id,
-    event,
-    reason
-):
+    user_id = owner_id()
+    chat_id = event.chat_id
 
-    client = CLIENTS.get(
-        user_id
+    if chat_id is None:
+
+        await event.respond(
+            "❌ No chat detected."
+        )
+
+        return
+
+    set_selected_chat(
+        user_id,
+        chat_id
     )
 
-    if not client:
+    await event.respond(
+        "✅ Current chat selected.\n\n"
+        f"🆔 Chat ID: `{chat_id}`"
+    )
+
+
+# ============================================================
+# /CHANNEL
+# ============================================================
+
+@client.on(
+    events.NewMessage(
+        pattern=r"^/channel$"
+    )
+)
+async def channel_handler(event):
+
+    if not await owner_only(event):
         return
+
+    user_id = owner_id()
+    chat_id = event.chat_id
+
+    if chat_id is None:
+
+        await event.respond(
+            "❌ No channel detected."
+        )
+
+        return
+
+    set_selected_channel(
+        user_id,
+        chat_id
+    )
+
+    await event.respond(
+        "✅ Current channel selected.\n\n"
+        f"🆔 Channel ID: `{chat_id}`"
+    )
+
+
+# ============================================================
+# /PROTECTION ON / OFF
+# ============================================================
+
+@client.on(
+    events.NewMessage(
+        pattern=r"^/protection\s+(on|off)$"
+    )
+)
+async def protection_handler(event):
+
+    if not await owner_only(event):
+        return
+
+    user_id = owner_id()
+
+    command = (
+        event.pattern_match
+        .group(1)
+        .lower()
+    )
+
+    enabled = command == "on"
+
+    set_setting(
+        user_id,
+        "global_protection",
+        1 if enabled else 0
+    )
+
+    await event.respond(
+        "🛡️ Global protection is "
+        + (
+            "ON 🟢"
+            if enabled
+            else "OFF 🔴"
+        )
+    )
+
+
+# ============================================================
+# /BLOCKWORD
+# ============================================================
+
+@client.on(
+    events.NewMessage(
+        pattern=r"^/blockword\s+(.+)$"
+    )
+)
+async def blockword_handler(event):
+
+    if not await owner_only(event):
+        return
+
+    user_id = owner_id()
+
+    word = (
+        event.pattern_match
+        .group(1)
+        .strip()
+        .lower()
+    )
 
     chat_id = event.chat_id
 
-    sender_id = event.sender_id
+    if chat_id is None:
 
-    if not sender_id:
-        return
-
-    try:
-
-        await client.delete_messages(
-            chat_id,
-            event.message.id
+        await event.respond(
+            "❌ No chat detected."
         )
 
-    except Exception:
+        return
+
+    add_blocked_word(
+        user_id,
+        chat_id,
+        word
+    )
+
+    set_setting(
+        user_id,
+        "anti_word",
+        1
+    )
+
+    await event.respond(
+        "🚫 Blocked word added:\n\n"
+        f"`{word}`\n\n"
+        "Anti-word protection is now ON."
+    )
+
+
+# ============================================================
+# /UNBLOCKWORD
+# ============================================================
+
+@client.on(
+    events.NewMessage(
+        pattern=r"^/unblockword\s+(.+)$"
+    )
+)
+async def unblockword_handler(event):
+
+    if not await owner_only(event):
+        return
+
+    user_id = owner_id()
+
+    word = (
+        event.pattern_match
+        .group(1)
+        .strip()
+        .lower()
+    )
+
+    chat_id = event.chat_id
+
+    if chat_id is None:
+
+        await event.respond(
+            "❌ No chat detected."
+        )
+
+        return
+
+    remove_blocked_word(
+        user_id,
+        chat_id,
+        word
+    )
+
+    await event.respond(
+        "✅ Blocked word removed:\n\n"
+        f"`{word}`"
+    )
+
+
+# ============================================================
+# /BLOCKEDWORDS
+# ============================================================
+
+@client.on(
+    events.NewMessage(
+        pattern=r"^/blockedwords$"
+    )
+)
+async def blockedwords_handler(event):
+
+    if not await owner_only(event):
+        return
+
+    user_id = owner_id()
+    chat_id = event.chat_id
+
+    if chat_id is None:
+
+        await event.respond(
+            "❌ No chat detected."
+        )
+
+        return
+
+    words = get_blocked_words(
+        user_id,
+        chat_id
+    )
+
+    if not words:
+
+        await event.respond(
+            "📭 No blocked words "
+            "for this chat."
+        )
+
+        return
+
+    text = (
+        "🚫 BLOCKED WORDS\n\n"
+        + "\n".join(
+            f"• {word}"
+            for word in words
+        )
+    )
+
+    await event.respond(text)
+
+
+# ============================================================
+# /WARN
+# ============================================================
+
+@client.on(
+    events.NewMessage(
+        pattern=r"^/warn$"
+    )
+)
+async def warn_handler(event):
+
+    if not await owner_only(event):
+        return
+
+    user_id = owner_id()
+
+    if not event.is_group:
+
+        await event.respond(
+            "❌ /warn can only be used "
+            "inside a group."
+        )
+
+        return
+
+    if not event.is_reply:
+
+        await event.respond(
+            "↩️ Reply to a user's message "
+            "with /warn."
+        )
+
+        return
+
+    reply = await event.get_reply_message()
+
+    if not reply:
+        return
+
+    target_id = reply.sender_id
+
+    if target_id is None:
+
+        await event.respond(
+            "❌ I couldn't identify "
+            "that user."
+        )
 
         return
 
     count = add_warning(
         user_id,
-        chat_id,
-        sender_id
+        event.chat_id,
+        target_id
     )
 
-    limit = int(
-        get_setting(
-            user_id,
-            "warning_limit",
-            5
-        )
+    limit = get_setting(
+        user_id,
+        "warning_limit",
+        5
     )
 
-    try:
-
-        await client.send_message(
-            chat_id,
-            f"{reason}\n\n"
-            f"⚠️ Warning {count}/{limit}"
-        )
-
-    except Exception:
-
-        pass
-
-    if count >= limit:
-
-        try:
-
-            await client.edit_permissions(
-                chat_id,
-                sender_id,
-                view_messages=False
-            )
-
-            clear_warnings(
-                user_id,
-                chat_id,
-                sender_id
-            )
-
-        except Exception:
-
-            pass
-
-
-async def protection_event(
-    user_id,
-    event
-):
-
-    client = CLIENTS.get(
-        user_id
+    log_action(
+        user_id,
+        event.chat_id,
+        "warning",
+        target_id,
+        f"Warning {count}/{limit}"
     )
 
-    if not client:
+    await event.respond(
+        "⚠️ WARNING ISSUED\n\n"
+        f"Warnings: {count}/{limit}"
+    )
+
+
+# ============================================================
+# /WARNINGS
+# ============================================================
+
+@client.on(
+    events.NewMessage(
+        pattern=r"^/warnings$"
+    )
+)
+async def warnings_handler(event):
+
+    if not await owner_only(event):
         return
 
+    user_id = owner_id()
+
+    if not event.is_reply:
+
+        await event.respond(
+            "↩️ Reply to a user's message "
+            "with /warnings."
+        )
+
+        return
+
+    reply = await event.get_reply_message()
+
+    if not reply:
+        return
+
+    target_id = reply.sender_id
+
+    if target_id is None:
+        return
+
+    count = get_warning_count(
+        user_id,
+        event.chat_id,
+        target_id
+    )
+
+    limit = get_setting(
+        user_id,
+        "warning_limit",
+        5
+    )
+
+    await event.respond(
+        "⚠️ USER WARNINGS\n\n"
+        f"Warnings: {count}/{limit}"
+    )
+
+
+# ============================================================
+# /CLEARWARN
+# ============================================================
+
+@client.on(
+    events.NewMessage(
+        pattern=r"^/clearwarn$"
+    )
+)
+async def clearwarn_handler(event):
+
+    if not await owner_only(event):
+        return
+
+    user_id = owner_id()
+
+    if not event.is_reply:
+
+        await event.respond(
+            "↩️ Reply to the user's message "
+            "with /clearwarn."
+        )
+
+        return
+
+    reply = await event.get_reply_message()
+
+    if not reply:
+        return
+
+    target_id = reply.sender_id
+
+    if target_id is None:
+        return
+
+    clear_warnings(
+        user_id,
+        event.chat_id,
+        target_id
+    )
+
+    log_action(
+        user_id,
+        event.chat_id,
+        "clear_warning",
+        target_id,
+        "Warnings cleared"
+    )
+
+    await event.respond(
+        "✅ User warnings cleared."
+    )
+
+
+# ============================================================
+# PRIVATE AUTO-REPLY
+# ============================================================
+
+@client.on(
+    events.NewMessage(
+        incoming=True
+    )
+)
+async def incoming_message_handler(event):
+
+    # Only private conversations.
+    if not event.is_private:
+        return
+
+    # Ignore our own outgoing messages.
+    if event.out:
+        return
+
+    # Ignore commands.
+    text = event.raw_text or ""
+
+    if text.startswith("/"):
+        return
+
+    # We need the owner account.
+    if not owner_ready():
+        return
+
+    user_id = owner_id()
+
+    ensure_user(user_id)
+
+    # Check auto reply.
+    enabled = get_setting(
+        user_id,
+        "auto_reply",
+        0
+    )
+
+    if not is_enabled(enabled):
+        return
+
+    # Don't repeatedly reply too quickly.
     chat_id = event.chat_id
 
-    message = event.message
+    if chat_id is None:
+        return
+
+    if not cooldown_allows(chat_id):
+        return
+
+    message = get_auto_reply_message(
+        user_id
+    )
 
     try:
 
-        me = await client.get_me()
-
-        permissions = (
-            await client.get_permissions(
-                chat_id,
-                me.id
-            )
+        await event.reply(
+            message
         )
 
-        if not (
-            permissions.is_admin
-            or permissions.is_creator
-        ):
-
-            return
-
-    except Exception:
-
-        return
-
-    text = (
-        message.raw_text
-        or ""
-    )
-
-    if (
-        get_setting(
+        log_action(
             user_id,
-            "anti_link",
-            0
-        )
-        and URL_PATTERN.search(
-            text
-        )
-    ):
-
-        await protected_delete_and_warn(
-            user_id,
-            event,
-            "🔗 Links aren't allowed."
-        )
-
-        return
-
-    if (
-        get_setting(
-            user_id,
-            "anti_forward",
-            0
-        )
-        and message.fwd_from
-    ):
-
-        await protected_delete_and_warn(
-            user_id,
-            event,
-            "↪️ Forwarded messages aren't allowed."
-        )
-
-        return
-
-    if (
-        get_setting(
-            user_id,
-            "anti_media",
-            0
-        )
-        and message.media
-    ):
-
-        await protected_delete_and_warn(
-            user_id,
-            event,
-            "🖼 Media isn't allowed."
-        )
-
-
-# ============================================================
-# PERSONAL ACCOUNT MESSAGE HANDLER
-# ============================================================
-
-async def handle_personal_message(
-    user_id,
-    event
-):
-
-    if user_id in STOPPED:
-        return
-
-    client = CLIENTS.get(
-        user_id
-    )
-
-    if not client:
-        return
-
-    message = event.message
-
-    if message.out:
-        return
-
-    # --------------------------------------------------------
-    # AUTO REPLY
-    # --------------------------------------------------------
-
-    if (
-        event.is_private
-        and get_setting(
-            user_id,
+            chat_id,
             "auto_reply",
-            0
-        )
-    ):
-
-        reply = get_setting(
-            user_id,
-            "auto_reply_message",
-            "I'm not online right now. I will message you later."
+            event.sender_id,
+            message
         )
 
-        try:
+        logger.info(
+            "Auto-reply sent to %s",
+            event.sender_id
+        )
 
-            await event.respond(
-                reply
-            )
+    except FloodWaitError as error:
 
-        except Exception:
+        logger.warning(
+            "Telegram requested a wait of "
+            "%s seconds.",
+            error.seconds
+        )
 
-            pass
+    except RPCError as error:
 
-    # --------------------------------------------------------
-    # AUTO REACT
-    # --------------------------------------------------------
+        logger.error(
+            "Telegram RPC error: %s",
+            error
+        )
 
-    if get_setting(
-        user_id,
-        "auto_react",
-        0
-    ):
+    except Exception as error:
 
-        try:
-
-            emoji = get_setting(
-                user_id,
-                "auto_react_emoji",
-                "👍"
-            )
-
-            await client(
-                functions.messages.SendReactionRequest(
-                    peer=event.chat_id,
-                    msg_id=message.id,
-                    reaction=[
-                        types.ReactionEmoji(
-                            emoticon=emoji
-                        )
-                    ]
-                )
-            )
-
-        except Exception:
-
-            pass
-
-    # --------------------------------------------------------
-    # GROUP PROTECTION
-    # --------------------------------------------------------
-
-    if (
-        event.is_group
-        or event.is_channel
-    ):
-
-        await protection_event(
-            user_id,
-            event
+        logger.exception(
+            "Auto-reply failed: %s",
+            error
         )
 
 
-async def install_handlers(
-    user_id,
-    client
-):
+# ============================================================
+# GROUP PROTECTION
+# ============================================================
 
-    if user_id in HANDLERS_INSTALLED:
+@client.on(
+    events.NewMessage(
+        incoming=True
+    )
+)
+async def protection_handler(event):
+
+    # Only groups.
+    if not event.is_group:
         return
 
-    async def incoming(event):
+    # Don't process our own messages.
+    if event.out:
+        return
 
-        await handle_personal_message(
+    # Need the owner.
+    if not owner_ready():
+        return
+
+    user_id = owner_id()
+
+    ensure_user(user_id)
+
+    # Global protection.
+    protection = get_setting(
+        user_id,
+        "global_protection",
+        0
+    )
+
+    if not is_enabled(protection):
+        return
+
+    # Anti-word protection.
+    anti_word = get_setting(
+        user_id,
+        "anti_word",
+        0
+    )
+
+    if not is_enabled(anti_word):
+        return
+
+    words = get_blocked_words(
+        user_id,
+        event.chat_id
+    )
+
+    if not words:
+        return
+
+    message_text = (
+        event.raw_text or ""
+    ).lower()
+
+    matched_word = None
+
+    for word in words:
+
+        if word and word in message_text:
+
+            matched_word = word
+            break
+
+    if matched_word is None:
+        return
+
+    try:
+
+        await event.delete()
+
+        log_action(
             user_id,
-            event
+            event.chat_id,
+            "blocked_word",
+            event.sender_id,
+            matched_word
         )
 
-    client.add_event_handler(
-        incoming,
-        events.NewMessage(
-            incoming=True
+        logger.info(
+            "Deleted blocked-word message "
+            "from %s",
+            event.sender_id
         )
-    )
 
-    HANDLERS_INSTALLED.add(
-        user_id
-    )
+    except FloodWaitError as error:
+
+        logger.warning(
+            "Flood wait while deleting: "
+            "%s seconds",
+            error.seconds
+        )
+
+    except RPCError as error:
+
+        logger.warning(
+            "Telegram error while deleting: %s",
+            error
+        )
+
+    except Exception as error:
+
+        logger.exception(
+            "Protection handler failed: %s",
+            error
+        )
 
 
 # ============================================================
-# CALLBACKS
+# START APPLICATION
 # ============================================================
 
-async def callback_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def main():
 
-    query = update.callback_query
+    global OWNER_ID
+    global OWNER_NAME
 
-    await query.answer()
-
-    user_id = query.from_user.id
-
-    ensure_user(
-        user_id
+    logger.info(
+        "=================================================="
     )
 
-    data = query.data
+    logger.info(
+        "Starting Telegram Secretary..."
+    )
 
-    # --------------------------------------------------------
-    # ACCOUNT
-    # --------------------------------------------------------
+    logger.info(
+        "=================================================="
+    )
 
-    if data == "account":
+    try:
 
-        client = await get_client(
-            user_id
-        )
-
-        if not client:
-
-            await query.edit_message_text(
-                "❌ Telegram account isn't connected.",
-                reply_markup=menu()
-            )
-
-            return
+        await client.start()
 
         me = await client.get_me()
 
-        await query.edit_message_text(
-            "👤 MY ACCOUNT\n\n"
-            f"Name: {me.first_name or ''}\n"
-            f"Username: @{me.username or 'None'}\n"
-            f"ID: {me.id}\n\n"
-            "🟢 Connected",
-            reply_markup=menu()
-        )
+        OWNER_ID = me.id
 
-        return
-
-    # --------------------------------------------------------
-    # GROUP SELECTION
-    # --------------------------------------------------------
-
-    if data.startswith(
-        "group:"
-    ):
-
-        chat_id = int(
-            data.split(
-                ":",
-                1
-            )[1]
-        )
-
-        set_selected_chat(
-            user_id,
-            chat_id
-        )
-
-        await query.edit_message_text(
-            "✅ Group selected.\n\n"
-            f"Chat ID: {chat_id}\n\n"
-            "Moderator commands will now target "
-            "this group.",
-            reply_markup=menu()
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # PROTECTION
-    # --------------------------------------------------------
-
-    if data == "protection":
-
-        keyboard = [
-
-            [
-                InlineKeyboardButton(
-                    "🔗 Anti-Link",
-                    callback_data="toggle:anti_link"
-                ),
-
-                InlineKeyboardButton(
-                    "🚫 Anti-Spam",
-                    callback_data="toggle:anti_spam"
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    "🤖 Anti-Bot",
-                    callback_data="toggle:anti_bot"
-                ),
-
-                InlineKeyboardButton(
-                    "🌊 Anti-Flood",
-                    callback_data="toggle:anti_flood"
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    "📩 Anti-Invite",
-                    callback_data="toggle:anti_invite"
-                ),
-
-                InlineKeyboardButton(
-                    "🚨 Raid",
-                    callback_data="toggle:raid_mode"
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    "⬅️ Back",
-                    callback_data="back"
-                )
-            ]
-        ]
-
-        await query.edit_message_text(
-            protection_panel(
-                user_id
-            ),
-            reply_markup=InlineKeyboardMarkup(
-                keyboard
+        OWNER_NAME = (
+            getattr(
+                me,
+                "username",
+                None
             )
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # TOGGLE
-    # --------------------------------------------------------
-
-    if data.startswith(
-        "toggle:"
-    ):
-
-        key = data.split(
-            ":",
-            1
-        )[1]
-
-        allowed = {
-            "anti_link",
-            "anti_spam",
-            "anti_bot",
-            "anti_flood",
-            "anti_invite",
-            "raid_mode"
-        }
-
-        if key not in allowed:
-            return
-
-        current = int(
-            get_setting(
-                user_id,
-                key,
-                0
+            or getattr(
+                me,
+                "first_name",
+                None
             )
+            or "Unknown"
         )
 
-        set_setting(
-            user_id,
-            key,
-            0 if current else 1
+        # Make sure the logged-in account exists
+        # in the database.
+        ensure_user(
+            OWNER_ID
         )
 
-        await query.edit_message_text(
-            protection_panel(
-                user_id
-            ),
-            reply_markup=menu()
+        logger.info(
+            "Login successful."
         )
 
-        return
-
-    if data == "groups":
-
-        client = await get_client(
-            user_id
+        logger.info(
+            "Account: %s",
+            OWNER_NAME
         )
 
-        if not client:
+        logger.info(
+            "Telegram ID: %s",
+            OWNER_ID
+        )
 
-            await query.edit_message_text(
-                "❌ Connect Telegram first.",
-                reply_markup=menu()
+        logger.info(
+            "Auto-reply owner initialized."
+        )
+
+        logger.info(
+            "Secretary is now running."
+        )
+
+        logger.info(
+            "=================================================="
+        )
+
+        await client.run_until_disconnected()
+
+    except KeyboardInterrupt:
+
+        logger.info(
+            "Telegram Secretary stopped."
+        )
+
+    except Exception as error:
+
+        logger.exception(
+            "Fatal application error: %s",
+            error
+        )
+
+        raise
+
+    finally:
+
+        if client.is_connected():
+
+            await client.disconnect()
+
+            logger.info(
+                "Telegram client disconnected."
             )
-
-            return
-
-        buttons = []
-
-        async for dialog in client.iter_dialogs():
-
-            if dialog.is_group:
-
-                buttons.append(
-                    [
-                        InlineKeyboardButton(
-                            f"👥 {dialog.name[:35]}",
-                            callback_data=f"group:{dialog.id}"
-                        )
-                    ]
-                )
-
-            if len(buttons) >= 50:
-                break
-
-        await query.edit_message_text(
-            "👥 SELECT GROUP",
-            reply_markup=InlineKeyboardMarkup(
-                buttons
-            )
-        )
-
-        return
-
-    if data == "moderation":
-
-        await query.edit_message_text(
-            "🔨 MODERATOR\n\n"
-            "/ban @user\n"
-            "/unban @user\n"
-            "/mute @user\n"
-            "/unmute @user\n"
-            "/kick @user\n"
-            "/warn @user\n"
-            "/warnings @user\n"
-            "/clearwarnings @user\n"
-            "/purge 20\n"
-            "/lock\n"
-            "/unlock",
-            reply_markup=menu()
-        )
-
-        return
-
-    if data == "autoreply":
-
-        await query.edit_message_text(
-            "🤖 AUTO REPLY\n\n"
-            "/set msg on\n"
-            "/set msg off\n"
-            "/set msg Your message",
-            reply_markup=menu()
-        )
-
-        return
-
-    if data == "autoreact":
-
-        await query.edit_message_text(
-            "❤️ AUTO REACT\n\n"
-            "/autoreact on\n"
-            "/autoreact off",
-            reply_markup=menu()
-        )
-
-        return
-
-    if data == "online":
-
-        await query.edit_message_text(
-            "🟢 ONLINE STATUS\n\n"
-            "/alwaysonline on\n"
-            "/alwaysonline off\n\n"
-            "Telegram privacy settings still apply.",
-            reply_markup=menu()
-        )
-
-        return
-
-    if data == "settings":
-
-        await query.edit_message_text(
-            protection_panel(
-                user_id
-            ),
-            reply_markup=menu()
-        )
-
-        return
-
-    if data == "stop":
-
-        STOPPED.add(
-            user_id
-        )
-
-        await query.edit_message_text(
-            "🛑 Emergency stop activated.\n\n"
-            "Use /resume to continue."
-        )
-
-        return
-
-    if data == "back":
-
-        await query.edit_message_text(
-            WELCOME,
-            reply_markup=menu()
-        )
 
 
 # ============================================================
-# GENERIC 200-COMMAND ROUTER
+# ENTRY POINT
 # ============================================================
-
-async def generic_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    command = (
-        update.message.text
-        .split()[0]
-        .lstrip("/")
-        .split("@")[0]
-        .lower()
-    )
-
-    user_id = (
-        update.effective_user.id
-    )
-
-    # --------------------------------------------------------
-    # PROTECTION COMMANDS
-    # --------------------------------------------------------
-
-    protection_map = {
-
-        "linkprotect":
-            "anti_link",
-
-        "inviteprotect":
-            "anti_invite",
-
-        "spamprotect":
-            "anti_spam",
-
-        "botprotect":
-            "anti_bot",
-
-        "floodprotect":
-            "anti_flood",
-
-        "mentionprotect":
-            "anti_mention",
-
-        "forwardprotect":
-            "anti_forward",
-
-        "mediaprotect":
-            "anti_media",
-
-        "newmemberprotect":
-            "anti_newmember",
-
-        "raidmode":
-            "raid_mode"
-    }
-
-    for name, key in protection_map.items():
-
-        if command == name + "on":
-
-            set_setting(
-                user_id,
-                key,
-                1
-            )
-
-            await update.message.reply_text(
-                f"🟢 {name} ON"
-            )
-
-            return
-
-        if command == name + "off":
-
-            set_setting(
-                user_id,
-                key,
-                0
-            )
-
-            await update.message.reply_text(
-                f"⚪ {name} OFF"
-            )
-
-            return
-
-    if command in protection_map:
-
-        key = protection_map[
-            command
-        ]
-
-        if context.args:
-
-            value = (
-                context.args[0]
-                .lower()
-            )
-
-            if value in (
-                "on",
-                "off"
-            ):
-
-                enabled = (
-                    value
-                    == "on"
-                )
-
-                set_setting(
-                    user_id,
-                    key,
-                    int(enabled)
-                )
-
-                await update.message.reply_text(
-                    f"{command}: "
-                    f"{'ON' if enabled else 'OFF'}"
-                )
-
-                return
-
-        await update.message.reply_text(
-            f"/{command} on|off"
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # COMMAND RECOGNIZED
-    # --------------------------------------------------------
-
-    if command in COMMANDS:
-
-        await update.message.reply_text(
-            f"✅ /{command} recognized.\n\n"
-            "This command uses the currently selected "
-            "group/channel and the connected account's "
-            "Telegram permissions."
-        )
-
-        return
-
-
-# ============================================================
-# RESUME
-# ============================================================
-
-async def resume_cmd(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    user_id = update.effective_user.id
-
-    STOPPED.discard(
-        user_id
-    )
-
-    await update.message.reply_text(
-        "🟢 Automation resumed."
-    )
-
-
-# ============================================================
-# REGISTER COMMANDS
-# ============================================================
-
-def register_commands(app):
-
-    app.add_handler(
-        CommandHandler(
-            "start",
-            start
-        )
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "status",
-            status_cmd
-        )
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "set",
-            set_cmd
-        )
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "autoreact",
-            autoreact_cmd
-        )
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "alwaysonline",
-            alwaysonline_cmd
-        )
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "groups",
-            groups_cmd
-        )
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "group",
-            groups_cmd
-        )
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "resume",
-            resume_cmd
-        )
-    )
-
-    reserved = {
-        "start",
-        "status",
-        "set",
-        "autoreact",
-        "alwaysonline",
-        "groups",
-        "group",
-        "resume"
-    }
-
-    for command in COMMANDS:
-
-        if command in reserved:
-            continue
-
-        app.add_handler(
-            CommandHandler(
-                command,
-                generic_command
-            )
-        )
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main():
-
-    init_db()
-
-    app = (
-        Application
-        .builder()
-        .token(
-            BOT_TOKEN
-        )
-        .build()
-    )
-
-    register_commands(
-        app
-    )
-
-    app.add_handler(
-        CallbackQueryHandler(
-            callback_handler
-        )
-    )
-
-    log.info(
-        "Telegram Secretary starting..."
-    )
-
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES
-    )
-
 
 if __name__ == "__main__":
 
-    main()
+    try:
+
+        asyncio.run(
+            main()
+        )
+
+    except KeyboardInterrupt:
+
+        pass
