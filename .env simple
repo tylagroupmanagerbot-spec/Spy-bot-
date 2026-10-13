@@ -1,1 +1,17 @@
-BOT_TOKEN=YOUR_BOTFATHER_TOKEN
+# ==========================================
+# TELEGRAM SECRETARY BOT
+# File: .env
+# ==========================================
+
+# BotFather bot token
+BOT_TOKEN=YOUR_BOT_TOKEN_HERE
+
+# Telegram API credentials from my.telegram.org
+API_ID=YOUR_API_ID_HERE
+API_HASH=YOUR_API_HASH_HERE
+
+# Fernet key used to encrypt Telegram sessions
+SESSION_KEY=YOUR_FERNET_KEY_HERE
+
+# Render web service port
+PORT=10000
