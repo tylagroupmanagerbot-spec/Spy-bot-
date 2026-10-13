@@ -2,10 +2,14 @@
 # TELEGRAM SECRETARY / CHAT AUTOMATION BOT
 # File: main.py
 # Python 3.10+
+# Render Web Service compatible
 # ============================================================
 
 import os
 import time
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
 import requests
 from dotenv import load_dotenv
 
@@ -15,9 +19,10 @@ from database import (
     set_auto_reply_message,
 )
 
-# ------------------------------------------------------------
+
+# ============================================================
 # CONFIG
-# ------------------------------------------------------------
+# ============================================================
 
 load_dotenv()
 
@@ -25,27 +30,79 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 if not BOT_TOKEN:
     raise RuntimeError(
-        "BOT_TOKEN is missing. Add your BotFather token to .env"
+        "BOT_TOKEN is missing. Add it in Render Environment Variables."
     )
 
 API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# Store known business/secretary connections
+# Render provides PORT automatically
+PORT = int(os.getenv("PORT", "10000"))
+
+# Store known Business/Secretary connections
 business_connections = {}
 
-# Prevent duplicate processing
+# Prevent duplicate message processing
 processed_messages = set()
 
 
-# ------------------------------------------------------------
+# ============================================================
+# RENDER WEB SERVER
+# ============================================================
+
+class HealthHandler(BaseHTTPRequestHandler):
+
+    def do_GET(self):
+
+        self.send_response(200)
+        self.send_header(
+            "Content-Type",
+            "text/plain; charset=utf-8"
+        )
+        self.end_headers()
+
+        self.wfile.write(
+            b"Telegram Secretary Bot is running."
+        )
+
+    def do_HEAD(self):
+
+        self.send_response(200)
+        self.send_header(
+            "Content-Type",
+            "text/plain; charset=utf-8"
+        )
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        # Disable HTTP request logging
+        return
+
+
+def start_web_server():
+
+    server = HTTPServer(
+        ("0.0.0.0", PORT),
+        HealthHandler
+    )
+
+    print("=" * 45)
+    print(f"🌐 Web server listening on port {PORT}")
+    print("=" * 45)
+
+    server.serve_forever()
+
+
+# ============================================================
 # TELEGRAM API REQUEST
-# ------------------------------------------------------------
+# ============================================================
 
 def telegram(method, data=None):
+
     if data is None:
         data = {}
 
     try:
+
         response = requests.post(
             f"{API_URL}/{method}",
             json=data,
@@ -55,6 +112,7 @@ def telegram(method, data=None):
         result = response.json()
 
         if not result.get("ok"):
+
             print(
                 f"❌ Telegram API error [{method}]:",
                 result.get("description")
@@ -63,15 +121,22 @@ def telegram(method, data=None):
         return result
 
     except Exception as error:
-        print(f"❌ Request error [{method}]: {error}")
-        return {"ok": False}
+
+        print(
+            f"❌ Request error [{method}]: {error}"
+        )
+
+        return {
+            "ok": False
+        }
 
 
-# ------------------------------------------------------------
+# ============================================================
 # SEND NORMAL BOT MESSAGE
-# ------------------------------------------------------------
+# ============================================================
 
 def send_bot_message(chat_id, text):
+
     return telegram(
         "sendMessage",
         {
@@ -81,9 +146,9 @@ def send_bot_message(chat_id, text):
     )
 
 
-# ------------------------------------------------------------
+# ============================================================
 # NORMAL BOT COMMANDS
-# ------------------------------------------------------------
+# ============================================================
 
 def handle_normal_message(message):
 
@@ -93,11 +158,12 @@ def handle_normal_message(message):
         return
 
     chat_id = message["chat"]["id"]
+
     text = text.strip()
 
-    # ------------------------
+    # --------------------------------------------------------
     # /start
-    # ------------------------
+    # --------------------------------------------------------
 
     if text == "/start":
 
@@ -116,58 +182,64 @@ def handle_normal_message(message):
 
         return
 
-    # ------------------------
+    # --------------------------------------------------------
     # /help
-    # ------------------------
+    # --------------------------------------------------------
 
     if text == "/help":
 
         send_bot_message(
             chat_id,
             "📖 Secretary Automation Help\n\n"
-
             "🟢 Turn auto reply ON:\n"
             "/set msg on I'm not online, I will msg you later.\n\n"
-
             "🔴 Turn auto reply OFF:\n"
             "/set msg off\n\n"
-
             "📊 Check automation:\n"
             "/status"
         )
 
         return
 
-    # ------------------------
+    # --------------------------------------------------------
     # /status
-    # ------------------------
+    # --------------------------------------------------------
 
     if text == "/status":
 
         settings = get_settings()
 
-        enabled = settings.get("enabled", False)
+        enabled = settings.get(
+            "enabled",
+            False
+        )
+
         reply_message = settings.get(
             "message",
             "I'm not online, I will msg you later."
         )
 
-        status = "🟢 ON" if enabled else "🔴 OFF"
+        status = (
+            "🟢 ON"
+            if enabled
+            else
+            "🔴 OFF"
+        )
 
         send_bot_message(
             chat_id,
-            f"🤖 Secretary Status\n\n"
+            "🤖 Secretary Status\n\n"
             f"Automatic reply: {status}\n\n"
-            f"Current message:\n"
+            "Current message:\n"
             f"{reply_message}\n\n"
             f"Connections: {len(business_connections)}"
         )
 
         return
 
-    # ------------------------
+    # --------------------------------------------------------
     # /set msg off
-    # ------------------------
+    # --------------------------------------------------------
 
     if text.lower() == "/set msg off":
 
@@ -180,9 +252,9 @@ def handle_normal_message(message):
 
         return
 
-    # ------------------------
+    # --------------------------------------------------------
     # /set msg on MESSAGE
-    # ------------------------
+    # --------------------------------------------------------
 
     prefix = "/set msg on"
 
@@ -201,7 +273,10 @@ def handle_normal_message(message):
 
             return
 
-        set_auto_reply_message(new_message)
+        set_auto_reply_message(
+            new_message
+        )
+
         set_auto_reply(True)
 
         send_bot_message(
@@ -213,9 +288,9 @@ def handle_normal_message(message):
         return
 
 
-# ------------------------------------------------------------
+# ============================================================
 # BUSINESS / SECRETARY CONNECTION
-# ------------------------------------------------------------
+# ============================================================
 
 def handle_business_connection(connection):
 
@@ -224,23 +299,49 @@ def handle_business_connection(connection):
     if not connection_id:
         return
 
-    business_connections[connection_id] = connection
+    business_connections[
+        connection_id
+    ] = connection
 
     print("\n====================================")
     print("🔗 SECRETARY CONNECTION")
     print("====================================")
 
-    print("Connection ID:", connection_id)
+    print(
+        "Connection ID:",
+        connection_id
+    )
 
-    user = connection.get("user", {})
+    user = connection.get(
+        "user",
+        {}
+    )
 
-    print("Account ID:", user.get("id"))
-    print("Name:", user.get("first_name"))
-    print("Enabled:", connection.get("is_enabled"))
+    print(
+        "Account ID:",
+        user.get("id")
+    )
 
-    rights = connection.get("rights", {})
+    print(
+        "Name:",
+        user.get("first_name")
+    )
 
-    print("Can reply:", rights.get("can_reply"))
+    print(
+        "Enabled:",
+        connection.get("is_enabled")
+    )
+
+    rights = connection.get(
+        "rights",
+        {}
+    )
+
+    print(
+        "Can reply:",
+        rights.get("can_reply")
+    )
+
     print(
         "Can read messages:",
         rights.get("can_read_messages")
@@ -249,9 +350,9 @@ def handle_business_connection(connection):
     print("====================================\n")
 
 
-# ------------------------------------------------------------
-# MARK BUSINESS MESSAGE AS READ ✓✓
-# ------------------------------------------------------------
+# ============================================================
+# MARK BUSINESS MESSAGE AS READ
+# ============================================================
 
 def mark_as_read(
     connection_id,
@@ -262,13 +363,19 @@ def mark_as_read(
     result = telegram(
         "readBusinessMessage",
         {
-            "business_connection_id": connection_id,
-            "chat_id": chat_id,
-            "message_id": message_id
+            "business_connection_id":
+                connection_id,
+
+            "chat_id":
+                chat_id,
+
+            "message_id":
+                message_id
         }
     )
 
     if result.get("ok"):
+
         print(
             f"✓✓ Message {message_id} marked as read"
         )
@@ -276,9 +383,9 @@ def mark_as_read(
     return result
 
 
-# ------------------------------------------------------------
+# ============================================================
 # SEND MESSAGE ON BEHALF OF BUSINESS ACCOUNT
-# ------------------------------------------------------------
+# ============================================================
 
 def send_business_message(
     connection_id,
@@ -289,13 +396,19 @@ def send_business_message(
     result = telegram(
         "sendMessage",
         {
-            "business_connection_id": connection_id,
-            "chat_id": chat_id,
-            "text": text
+            "business_connection_id":
+                connection_id,
+
+            "chat_id":
+                chat_id,
+
+            "text":
+                text
         }
     )
 
     if result.get("ok"):
+
         print(
             f"✅ Automatic reply sent to {chat_id}"
         )
@@ -303,9 +416,9 @@ def send_business_message(
     return result
 
 
-# ------------------------------------------------------------
+# ============================================================
 # INCOMING SECRETARY MESSAGE
-# ------------------------------------------------------------
+# ============================================================
 
 def handle_business_message(message):
 
@@ -316,48 +429,69 @@ def handle_business_message(message):
     if not connection_id:
         return
 
-    chat = message.get("chat", {})
+    chat = message.get(
+        "chat",
+        {}
+    )
 
     chat_id = chat.get("id")
-    message_id = message.get("message_id")
+
+    message_id = message.get(
+        "message_id"
+    )
 
     if not chat_id or not message_id:
         return
 
-    # ----------------------------------------
-    # Prevent processing the same message twice
-    # ----------------------------------------
+    # --------------------------------------------------------
+    # Prevent duplicate processing
+    # --------------------------------------------------------
 
     unique_id = (
-        f"{connection_id}:{chat_id}:{message_id}"
+        f"{connection_id}:"
+        f"{chat_id}:"
+        f"{message_id}"
     )
 
     if unique_id in processed_messages:
         return
 
-    processed_messages.add(unique_id)
+    processed_messages.add(
+        unique_id
+    )
 
     # Prevent unlimited memory usage
     if len(processed_messages) > 5000:
+
         processed_messages.clear()
 
-    # ----------------------------------------
+    # --------------------------------------------------------
     # Ignore messages created by this bot
-    # ----------------------------------------
+    # --------------------------------------------------------
 
-    if message.get("sender_business_bot"):
+    if message.get(
+        "sender_business_bot"
+    ):
+
         return
+
+    # --------------------------------------------------------
+    # Get connection rights
+    # --------------------------------------------------------
 
     connection = business_connections.get(
         connection_id,
         {}
     )
 
-    rights = connection.get("rights", {})
+    rights = connection.get(
+        "rights",
+        {}
+    )
 
-    # ----------------------------------------
-    # BLUE TICKS ✓✓
-    # ----------------------------------------
+    # --------------------------------------------------------
+    # MARK MESSAGE AS READ
+    # --------------------------------------------------------
 
     can_read = rights.get(
         "can_read_messages",
@@ -379,23 +513,29 @@ def handle_business_message(message):
             "to mark messages as read."
         )
 
-    # ----------------------------------------
+    # --------------------------------------------------------
     # LOAD AUTO REPLY SETTINGS
-    # ----------------------------------------
+    # --------------------------------------------------------
 
     settings = get_settings()
 
-    if not settings.get("enabled", False):
+    if not settings.get(
+        "enabled",
+        False
+    ):
+
         return
 
-    reply_message = settings.get("message")
+    reply_message = settings.get(
+        "message"
+    )
 
     if not reply_message:
         return
 
-    # ----------------------------------------
+    # --------------------------------------------------------
     # CHECK REPLY PERMISSION
-    # ----------------------------------------
+    # --------------------------------------------------------
 
     can_reply = rights.get(
         "can_reply",
@@ -411,9 +551,9 @@ def handle_business_message(message):
 
         return
 
-    # ----------------------------------------
+    # --------------------------------------------------------
     # SEND AUTOMATIC REPLY
-    # ----------------------------------------
+    # --------------------------------------------------------
 
     send_business_message(
         connection_id,
@@ -422,29 +562,42 @@ def handle_business_message(message):
     )
 
 
-# ------------------------------------------------------------
+# ============================================================
 # PROCESS TELEGRAM UPDATE
-# ------------------------------------------------------------
+# ============================================================
 
 def handle_update(update):
 
     try:
 
+        # ----------------------------------------------------
         # Business / Secretary connection
+        # ----------------------------------------------------
+
         if "business_connection" in update:
 
             handle_business_connection(
-                update["business_connection"]
+                update[
+                    "business_connection"
+                ]
             )
 
-        # Incoming message handled by Secretary Mode
+        # ----------------------------------------------------
+        # Incoming Business message
+        # ----------------------------------------------------
+
         if "business_message" in update:
 
             handle_business_message(
-                update["business_message"]
+                update[
+                    "business_message"
+                ]
             )
 
+        # ----------------------------------------------------
         # Normal message sent directly to bot
+        # ----------------------------------------------------
+
         if "message" in update:
 
             handle_normal_message(
@@ -459,9 +612,9 @@ def handle_update(update):
         )
 
 
-# ------------------------------------------------------------
-# START BOT
-# ------------------------------------------------------------
+# ============================================================
+# START TELEGRAM BOT
+# ============================================================
 
 def start_bot():
 
@@ -469,13 +622,20 @@ def start_bot():
     print("🤖 TELEGRAM SECRETARY AUTOMATION")
     print("=" * 45)
 
+    # --------------------------------------------------------
     # Check BotFather token
+    # --------------------------------------------------------
 
-    me = telegram("getMe")
+    me = telegram(
+        "getMe"
+    )
 
     if not me.get("ok"):
 
-        print("❌ Invalid BOT_TOKEN.")
+        print(
+            "❌ Invalid BOT_TOKEN."
+        )
+
         return
 
     bot = me["result"]
@@ -484,7 +644,9 @@ def start_bot():
         f"✅ Logged in as @{bot.get('username')}"
     )
 
-    # Long polling cannot run while webhook is active
+    # --------------------------------------------------------
+    # Remove webhook so long polling can work
+    # --------------------------------------------------------
 
     telegram(
         "deleteWebhook",
@@ -493,8 +655,14 @@ def start_bot():
         }
     )
 
-    print("✅ Secretary automation started")
-    print("✅ Waiting for Telegram messages...")
+    print(
+        "✅ Secretary automation started"
+    )
+
+    print(
+        "✅ Waiting for Telegram messages..."
+    )
+
     print("=" * 45)
 
     offset = 0
@@ -507,6 +675,7 @@ def start_bot():
                 "getUpdates",
                 {
                     "offset": offset,
+
                     "timeout": 50,
 
                     "allowed_updates": [
@@ -522,6 +691,7 @@ def start_bot():
             if not response.get("ok"):
 
                 time.sleep(3)
+
                 continue
 
             updates = response.get(
@@ -535,11 +705,16 @@ def start_bot():
                     update["update_id"] + 1
                 )
 
-                handle_update(update)
+                handle_update(
+                    update
+                )
 
         except KeyboardInterrupt:
 
-            print("\n🛑 Bot stopped.")
+            print(
+                "\n🛑 Bot stopped."
+            )
+
             break
 
         except Exception as error:
@@ -552,9 +727,21 @@ def start_bot():
             time.sleep(3)
 
 
-# ------------------------------------------------------------
+# ============================================================
 # RUN
-# ------------------------------------------------------------
+# ============================================================
 
 if __name__ == "__main__":
+
+    # Start Render HTTP server
+    # in a background thread.
+
+    web_thread = threading.Thread(
+        target=start_web_server,
+        daemon=True
+    )
+
+    web_thread.start()
+
+    # Start Telegram long polling
     start_bot()
